@@ -90,7 +90,7 @@ class Version:
     - ``schema``：该版本生效的表结构。
     - ``files``：该版本可见的全部数据文件清单。
     - ``committed_batches``：截至该版本已提交的全部业务批次 id（幂等判定依据）。
-    - ``operation``：append / upsert / compact / evolve。
+    - ``operation``：append / upsert / delete / compact / evolve。
     """
 
     version: int
@@ -136,10 +136,11 @@ class WriteBatch:
       重复数据或新版本。
     - ``base_version``：调用方读取数据时基于的版本，用于乐观并发控制。
     - ``rows``：以列名为键的行数据（写入时按当前 schema 转换为列 id 存储）。
+      ``mode="delete"`` 时 rows 只含主键列，表示要删除的主键集合。
     """
 
     batch_id: str
     base_version: int
     partition: str
     rows: tuple[dict[str, Any], ...]
-    mode: str = "append"  # append | upsert
+    mode: str = "append"  # append | upsert | delete

@@ -8,6 +8,9 @@
   不同抛出 DuplicateBatchError。
 - upsert 按主键在分区内合并，版本序即覆盖序；append 在主键表上拒绝与既有
   数据或批内重复的主键，避免静默产生重复。
+- delete 按主键删除：重写该分区文件（去掉命中主键的行）产生新版本，旧版本
+  元数据与数据文件不动，因此历史快照仍读得到当时的行；删除主键不存在的行
+  是确定的无害结果（分区数据不变，仍产生新版本）。仅在声明了主键的表上可用。
 """
 
 from __future__ import annotations
@@ -31,7 +34,7 @@ from lakehouse.storage import LocalStore
 
 logger = logging.getLogger("lakehouse.table")
 
-_WRITE_OPS = ("append", "upsert")
+_WRITE_OPS = ("append", "upsert", "delete")
 
 
 class Table:
@@ -78,13 +81,19 @@ class Table:
             if batch.base_version != current:
                 self._check_conflict(batch, base=batch.base_version, current=current)
 
-            # 校验并按当前 schema 转换为列 id 存储
-            id_rows = [self._row_to_ids(cur.schema, r) for r in batch.rows]
-
-            if batch.mode == "append":
-                new_files, written = self._apply_append(cur, batch.partition, id_rows, meta)
+            # 校验并按当前 schema 转换为列 id 存储；delete 只取主键
+            if batch.mode == "delete":
+                pk_tuples = self._delete_pks(cur.schema, batch.rows)
+                new_files, written, detail = self._apply_delete(
+                    cur, batch.partition, pk_tuples, meta
+                )
             else:
-                new_files, written = self._apply_upsert(cur, batch.partition, id_rows, meta)
+                id_rows = [self._row_to_ids(cur.schema, r) for r in batch.rows]
+                if batch.mode == "append":
+                    new_files, written = self._apply_append(cur, batch.partition, id_rows, meta)
+                else:
+                    new_files, written = self._apply_upsert(cur, batch.partition, id_rows, meta)
+                detail = f"rows={len(id_rows)}"
 
             new_version = current + 1
             version = Version(
@@ -104,9 +113,9 @@ class Table:
             }
             self.store.save_table_meta(self.name, meta)
             logger.info(
-                "提交成功: table=%s batch=%s mode=%s partition=%s rows=%d -> v%d (base=v%d, files=%s)",
+                "提交成功: table=%s batch=%s mode=%s partition=%s %s -> v%d (base=v%d, files=%s)",
                 self.name, batch.batch_id, batch.mode, batch.partition,
-                len(id_rows), new_version, batch.base_version,
+                detail, new_version, batch.base_version,
                 [f.path for f in written],
             )
             return new_version
@@ -120,10 +129,9 @@ class Table:
             ver = self.store.load_version(self.name, v)
             if ver.operation not in _WRITE_OPS:
                 continue
-            touched = {f.partition for f in ver.files} - {
-                f.partition for f in self.store.load_version(self.name, v - 1).files
-            }
-            # 写提交的新增文件所在分区即其触及的分区
+            prev_paths = {f.path for f in self.store.load_version(self.name, v - 1).files}
+            # 写提交的新增文件（含重写分区产生的新文件）所在分区即其触及的分区
+            touched = {f.partition for f in ver.files if f.path not in prev_paths}
             if batch.partition in touched:
                 raise CommitConflictError(
                     f"提交冲突: batch={batch.batch_id!r} 基于 v{base}，但 v{v} "
@@ -176,6 +184,62 @@ class Table:
         new_file = DataFile(path=path, partition=partition, row_count=len(rows))
         kept = [f for f in cur.files if f.partition != partition]
         return kept + [new_file], [new_file]
+
+    def _delete_pks(self, schema: Schema, rows: tuple[dict[str, Any], ...]) -> list[tuple]:
+        """校验 delete 批次并提取主键元组（批内去重，结果确定）。
+
+        delete 批次只接受主键列：缺主键、含非主键列（含未知列）、类型不符
+        都以 ValidationError 明确拒绝；无主键的表直接拒绝。
+        """
+        if not schema.primary_keys:
+            raise ValidationError("delete 需要表定义主键")
+        pk_cols = [schema.column_by_name(n) for n in schema.primary_keys]
+        allowed = set(schema.primary_keys)
+        pks: list[tuple] = []
+        seen: set[tuple] = set()
+        for r in rows:
+            extra = set(r) - allowed
+            if extra:
+                raise ValidationError(
+                    f"delete 批次只能包含主键列 {sorted(allowed)}，收到非主键列: {sorted(extra)}"
+                )
+            key: list[Any] = []
+            for c in pk_cols:
+                if c.name not in r or r[c.name] is None:
+                    raise ValidationError(f"缺少主键列: {c.name!r}")
+                self._check_type(c.type, r[c.name], c.name)
+                key.append(r[c.name])
+            t = tuple(key)
+            if t not in seen:
+                seen.add(t)
+                pks.append(t)
+        return pks
+
+    def _apply_delete(self, cur: Version, partition: str, pk_tuples: list[tuple], meta: dict):
+        """按主键删除：重写该分区文件，去掉命中主键的行。
+
+        旧文件不删（旧版本仍引用），因此历史快照可见结果不变。分区本来没有
+        文件时不产生新文件（确定的无操作）；删除不存在的 主键只是重写后内容
+        不变，不会改坏数据。
+        """
+        pk_ids = self._pk_ids(cur.schema)
+        part_files = [f for f in cur.files if f.partition == partition]
+        if not part_files:
+            logger.info(
+                "删除无操作: table=%s 分区=%s 当前版本无文件，%d 个主键无需处理",
+                self.name, partition, len(pk_tuples),
+            )
+            return list(cur.files), [], f"keys={len(pk_tuples)} matched=0 (分区无文件)"
+        targets = set(pk_tuples)
+        existing = self._partition_rows(cur, partition)
+        matched = sum(1 for r in existing if self._pk_tuple(r, pk_ids) in targets)
+        remaining = [r for r in existing if self._pk_tuple(r, pk_ids) not in targets]
+        rel = self._next_file(meta, partition)
+        path = self.store.write_data_file(self.name, partition, rel.rsplit("/", 1)[-1], remaining)
+        new_file = DataFile(path=path, partition=partition, row_count=len(remaining))
+        kept = [f for f in cur.files if f.partition != partition]
+        detail = f"keys={len(pk_tuples)} matched={matched} 剩余行={len(remaining)}"
+        return kept + [new_file], [new_file], detail
 
     # ---- 读取 ----
     def read(self, version: int | None = None, partition: str | None = None) -> list[dict[str, Any]]:
