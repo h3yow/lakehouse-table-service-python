@@ -27,6 +27,18 @@ class CommitConflictError(LakehouseError):
     """
 
 
+class DeleteConflictError(CommitConflictError):
+    """删除批次与同分区的其它并发提交冲突，被明确拒绝。
+
+    是 CommitConflictError 的子类：客户端可沿用普通写入的“重读最新版本后
+    重试”逻辑；同时独立类型名让删除冲突与普通写入冲突在失败原因上可区分。
+    """
+
+
+class DeleteNotSupportedError(LakehouseError):
+    """在没有主键的表上按主键删除：能力不支持，必须明确拒绝。"""
+
+
 class DuplicateBatchError(LakehouseError):
     """批次重复但内容不一致：同一 batch_id 已提交过不同内容，被拒绝。
 

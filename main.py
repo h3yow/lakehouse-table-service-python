@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from lakehouse.errors import LakehouseError
-from lakehouse.models import Column, Schema, WriteBatch
+from lakehouse.models import Column, DeleteBatch, Schema, WriteBatch
 from lakehouse.storage import LocalStore
 from lakehouse.table import TableService
 
@@ -38,6 +38,13 @@ class CommitIn(BaseModel):
     partition: str
     mode: str = "append"
     rows: list[dict[str, Any]]
+
+
+class DeleteIn(BaseModel):
+    batch_id: str
+    base_version: int
+    partition: str
+    keys: list[dict[str, Any]]
 
 
 @app.exception_handler(LakehouseError)
@@ -70,6 +77,18 @@ def commit(name: str, body: CommitIn):
         partition=body.partition,
         rows=tuple(body.rows),
         mode=body.mode,
+    ))
+    return {"table": name, "version": version}
+
+
+@app.post("/tables/{name}/deletes")
+def commit_delete(name: str, body: DeleteIn):
+    table = service.get_table(name)
+    version = table.commit_delete(DeleteBatch(
+        batch_id=body.batch_id,
+        base_version=body.base_version,
+        partition=body.partition,
+        keys=tuple(body.keys),
     ))
     return {"table": name, "version": version}
 

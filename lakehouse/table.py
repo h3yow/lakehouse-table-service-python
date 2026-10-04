@@ -20,18 +20,30 @@ from typing import Any
 
 from lakehouse.errors import (
     CommitConflictError,
+    DeleteConflictError,
+    DeleteNotSupportedError,
     DuplicateBatchError,
+    LakehouseError,
     SchemaEvolutionError,
     TableAlreadyExistsError,
     TableNotFoundError,
     ValidationError,
 )
-from lakehouse.models import SUPPORTED_TYPES, Column, DataFile, Schema, Version, WriteBatch
+from lakehouse.models import (
+    SUPPORTED_TYPES,
+    Column,
+    DataFile,
+    DeleteBatch,
+    Schema,
+    Version,
+    WriteBatch,
+)
 from lakehouse.storage import LocalStore
 
 logger = logging.getLogger("lakehouse.table")
 
-_WRITE_OPS = ("append", "upsert")
+# 会与同分区其它业务提交互斥的操作（参与乐观并发冲突判定）
+_WRITE_OPS = ("append", "upsert", "delete")
 
 
 class Table:
@@ -74,9 +86,12 @@ class Table:
 
             cur = self.store.load_version(self.name, current)
 
-            # 冲突检测：base_version 之后是否有其他写提交触及同一分区
+            # 冲突检测：base_version 之后是否有其他写/删提交触及同一分区
             if batch.base_version != current:
-                self._check_conflict(batch, base=batch.base_version, current=current)
+                self._check_conflict(
+                    batch.batch_id, batch.partition, batch.base_version, current,
+                    conflict_exc=CommitConflictError,
+                )
 
             # 校验并按当前 schema 转换为列 id 存储
             id_rows = [self._row_to_ids(cur.schema, r) for r in batch.rows]
@@ -95,6 +110,7 @@ class Table:
                 files=tuple(new_files),
                 committed_batches=tuple(sorted(set(cur.committed_batches) | {batch.batch_id})),
                 parent_version=current,
+                partition=batch.partition,
             )
             self.store.save_version(self.name, version)
             meta["current_version"] = new_version
@@ -111,29 +127,132 @@ class Table:
             )
             return new_version
 
-    def _check_conflict(self, batch: WriteBatch, base: int, current: int) -> None:
+    # ---- 删除 ----
+    def commit_delete(self, batch: DeleteBatch) -> int:
+        """提交一个按主键删除的批次，返回新版本号（幂等重放返回原版本号）。
+
+        规则与普通写入一致：batch_id 幂等、base_version 乐观并发；区别在于
+        冲突抛出 DeleteConflictError，且无主键的表明确拒绝。
+        """
+        with self._lock:
+            meta = self.store.load_table_meta(self.name)
+            current = int(meta["current_version"])
+            fingerprint = self._delete_fingerprint(batch)
+
+            # 幂等判定：同一 batch_id 已提交过（与普通写入共用批次登记表）
+            known = meta.get("batches", {}).get(batch.batch_id)
+            if known is not None:
+                if known["fingerprint"] == fingerprint:
+                    logger.info(
+                        "删除幂等重放: table=%s batch=%s -> 已有版本 v%d，不产生新版本",
+                        self.name, batch.batch_id, known["version"],
+                    )
+                    return int(known["version"])
+                raise DuplicateBatchError(
+                    f"batch_id={batch.batch_id!r} 已以不同内容提交于 v{known['version']}，拒绝"
+                )
+
+            cur = self.store.load_version(self.name, current)
+            pk_ids = self._pk_ids(cur.schema)
+            if not pk_ids:
+                raise DeleteNotSupportedError(
+                    f"表 {self.name!r} 未定义主键，不支持按主键删除"
+                )
+
+            # 冲突检测：与同分区其它写/删提交撞车 -> DeleteConflictError
+            if batch.base_version != current:
+                self._check_conflict(
+                    batch.batch_id, batch.partition, batch.base_version, current,
+                    conflict_exc=DeleteConflictError,
+                )
+
+            # 删除主键转列 id（要求且只要求主键列齐备）
+            delete_keys: set[tuple] = set()
+            for k in batch.keys:
+                delete_keys.add(self._key_to_pk_tuple(cur.schema, k, pk_ids))
+
+            existing = self._partition_rows(cur, batch.partition)
+            kept_rows = [
+                r for r in existing if self._pk_tuple(r, pk_ids) not in delete_keys
+            ]
+            matched = len(existing) - len(kept_rows)
+
+            rel = self._next_file(meta, batch.partition)
+            path = self.store.write_data_file(
+                self.name, batch.partition, rel.rsplit("/", 1)[-1], kept_rows
+            )
+            new_file = DataFile(
+                path=path, partition=batch.partition, row_count=len(kept_rows)
+            )
+            new_files = [f for f in cur.files if f.partition != batch.partition] + [new_file]
+
+            new_version = current + 1
+            version = Version(
+                version=new_version,
+                batch_id=batch.batch_id,
+                operation="delete",
+                schema=cur.schema,
+                files=tuple(new_files),
+                committed_batches=tuple(sorted(set(cur.committed_batches) | {batch.batch_id})),
+                parent_version=current,
+                partition=batch.partition,
+            )
+            self.store.save_version(self.name, version)
+            meta["current_version"] = new_version
+            meta.setdefault("batches", {})[batch.batch_id] = {
+                "fingerprint": fingerprint,
+                "version": new_version,
+            }
+            self.store.save_table_meta(self.name, meta)
+            logger.info(
+                "删除成功: table=%s batch=%s partition=%s 请求主键=%d 命中=%d 剩余=%d "
+                "-> v%d (base=v%d, file=%s)",
+                self.name, batch.batch_id, batch.partition, len(delete_keys), matched,
+                len(kept_rows), new_version, batch.base_version, new_file.path,
+            )
+            return new_version
+
+    def _check_conflict(
+        self,
+        batch_id: str,
+        partition: str,
+        base: int,
+        current: int,
+        conflict_exc: type[LakehouseError] = CommitConflictError,
+    ) -> None:
         if base < 0 or base > current:
-            raise CommitConflictError(
+            raise conflict_exc(
                 f"base_version=v{base} 非法（当前 v{current}）"
             )
         for v in range(base + 1, current + 1):
             ver = self.store.load_version(self.name, v)
             if ver.operation not in _WRITE_OPS:
                 continue
-            touched = {f.partition for f in ver.files} - {
-                f.partition for f in self.store.load_version(self.name, v - 1).files
-            }
-            # 写提交的新增文件所在分区即其触及的分区
-            if batch.partition in touched:
-                raise CommitConflictError(
-                    f"提交冲突: batch={batch.batch_id!r} 基于 v{base}，但 v{v} "
-                    f"({ver.operation}, batch={ver.batch_id!r}) 已写入分区 "
-                    f"{batch.partition!r}；请基于 v{current} 重试"
+            touched = self._touched_partitions(ver, v)
+            # 写/删提交触及的分区与本批次分区相交即冲突，绝不静默覆盖
+            if partition in touched:
+                raise conflict_exc(
+                    f"提交冲突: batch={batch_id!r} 基于 v{base}，但 v{v} "
+                    f"({ver.operation}, batch={ver.batch_id!r}) 已触及分区 "
+                    f"{partition!r}；请基于 v{current} 重读后重试"
                 )
         logger.info(
             "冲突检测通过: table=%s batch=%s base=v%d current=v%d 分区不相交，按规则 rebase 合并",
-            self.name, batch.batch_id, base, current,
+            self.name, batch_id, base, current,
         )
+
+    def _touched_partitions(self, ver: Version, v: int) -> set[str]:
+        """返回某写/删版本触及的分区。
+
+        优先取版本记录中的 ``partition``；对早于该字段的旧版本，回退为
+        “相对上一版本新增文件所在分区”的判定。
+        """
+        if ver.partition is not None:
+            return {ver.partition}
+        prev_paths: set[str] = set()
+        if v > 0:
+            prev_paths = {f.path for f in self.store.load_version(self.name, v - 1).files}
+        return {f.partition for f in ver.files if f.path not in prev_paths}
 
     def _apply_append(self, cur: Version, partition: str, id_rows: list[dict[str, Any]], meta: dict):
         pk_ids = self._pk_ids(cur.schema)
@@ -357,6 +476,34 @@ class Table:
     @staticmethod
     def _pk_tuple(id_row: dict[str, Any], pk_ids: tuple[int, ...]) -> tuple:
         return tuple(id_row.get(str(i)) for i in pk_ids)
+
+    @staticmethod
+    def _key_to_pk_tuple(
+        schema: Schema, key: dict[str, Any], pk_ids: tuple[int, ...]
+    ) -> tuple:
+        """把删除键 {主键列名: 值} 转为列 id 主键元组；键必须恰好覆盖主键列。"""
+        pk_names = [c.name for c in schema.columns if c.id in pk_ids]
+        if set(key) != set(pk_names):
+            raise ValidationError(
+                f"删除键必须恰好包含主键列 {pk_names}，实际收到 {sorted(key)}"
+            )
+        out = []
+        for name in pk_names:
+            col = schema.column_by_name(name)
+            value = key[name]
+            if value is None:
+                raise ValidationError(f"主键列 {name!r} 不允许为 None")
+            Table._check_type(col.type, value, name)
+            out.append(value)
+        return tuple(out)
+
+    @staticmethod
+    def _delete_fingerprint(batch: DeleteBatch) -> str:
+        payload = json.dumps(
+            {"op": "delete", "partition": batch.partition, "keys": list(batch.keys)},
+            sort_keys=True, ensure_ascii=False, default=str,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _project(schema: Schema, id_row: dict[str, Any]) -> dict[str, Any]:

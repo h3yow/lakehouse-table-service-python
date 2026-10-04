@@ -90,7 +90,9 @@ class Version:
     - ``schema``：该版本生效的表结构。
     - ``files``：该版本可见的全部数据文件清单。
     - ``committed_batches``：截至该版本已提交的全部业务批次 id（幂等判定依据）。
-    - ``operation``：append / upsert / compact / evolve。
+    - ``operation``：append / upsert / delete / compact / evolve。
+    - ``partition``：写/删提交所触及的分区（仅该类操作有值），冲突检测据此
+      判定“触及相同分区”；压实/演进/建表为 None。
     """
 
     version: int
@@ -101,6 +103,7 @@ class Version:
     committed_batches: tuple[str, ...] = ()
     parent_version: int = 0
     timestamp: float = field(default_factory=time.time)
+    partition: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -112,6 +115,7 @@ class Version:
             "committed_batches": list(self.committed_batches),
             "parent_version": self.parent_version,
             "timestamp": self.timestamp,
+            "partition": self.partition,
         }
 
     @staticmethod
@@ -125,6 +129,7 @@ class Version:
             committed_batches=tuple(d.get("committed_batches", ())),
             parent_version=d.get("parent_version", 0),
             timestamp=d.get("timestamp", 0.0),
+            partition=d.get("partition"),
         )
 
 
@@ -143,3 +148,21 @@ class WriteBatch:
     partition: str
     rows: tuple[dict[str, Any], ...]
     mode: str = "append"  # append | upsert
+
+
+@dataclass(frozen=True)
+class DeleteBatch:
+    """一次行级删除批次：针对某个分区，删除给定主键集合对应的行。
+
+    - 仅在声明了主键的表上可用（否则提交被明确拒绝）。
+    - ``keys`` 中每项是 ``{主键列名: 值}``；可以只含主键列。
+    - ``batch_id`` 为幂等键：相同内容重放返回原版本，不产生新版本或痕迹。
+    - 语义同普通写入：携带 ``base_version`` 做乐观并发控制，与同分区其它
+      写/删提交撞车时被明确拒绝（DeleteConflictError），分区不相交则合并。
+    - 对当时不存在的主键删除是确定性 no-op：不报错、不改坏数据。
+    """
+
+    batch_id: str
+    base_version: int
+    partition: str
+    keys: tuple[dict[str, Any], ...]

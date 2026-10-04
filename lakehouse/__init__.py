@@ -2,6 +2,8 @@
 
 from lakehouse.errors import (
     CommitConflictError,
+    DeleteConflictError,
+    DeleteNotSupportedError,
     DuplicateBatchError,
     LakehouseError,
     SchemaEvolutionError,
@@ -13,6 +15,8 @@ from lakehouse.errors import (
 
 __all__ = [
     "CommitConflictError",
+    "DeleteConflictError",
+    "DeleteNotSupportedError",
     "DuplicateBatchError",
     "LakehouseError",
     "SchemaEvolutionError",
